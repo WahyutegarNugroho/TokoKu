@@ -33,8 +33,21 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# AI agent local state
+.opencode/
+
 # vercel
 .vercel
+
+# migration scripts with hardcoded secrets history
+/migrate.js
+/backfill.js
+/check_policies.js
+/confirm_users.js
+/fix_stores_policy.js
+/seed_categories.js
+/setup_storage.js
+/fix_rls.js
 
 # typescript
 *.tsbuildinfo
