@@ -177,7 +177,7 @@ export default function Sidebar({ onClose }: { onClose?: () => void }) {
               <span className="text-sm font-semibold text-charcoal">Aktifkan PPN</span>
               <button type="button" onClick={() => setTaxEnabled(!taxEnabled)}
                 className={`relative w-12 h-7 rounded-full transition-colors cursor-pointer ${taxEnabled ? 'bg-primary' : 'bg-stone'}`}>
-                <span className={`absolute top-0.5 left-0.5 w-6 h-6 bg-white rounded-full shadow transition-transform ${taxEnabled ? 'translate-x-5' : ''}`} />
+                <span className={`absolute top-0.5 left-0.5 w-6 h-6 bg-white dark:bg-slate-200 rounded-full shadow transition-transform ${taxEnabled ? 'translate-x-5' : ''}`} />
               </button>
             </div>
             {taxEnabled && (

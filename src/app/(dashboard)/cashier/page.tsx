@@ -13,7 +13,7 @@ import { useSyncEngine } from '@/hooks/useSyncEngine';
 import { useCashierData } from '@/hooks/useCashierData';
 import { useCheckout } from '@/hooks/useCheckout';
 import { useTransactionHistory } from '@/hooks/useTransactionHistory';
-import { Search, RefreshCw, Store, AlertTriangle } from 'lucide-react';
+import { Search, RefreshCw, Store, AlertTriangle, ArrowDownCircle, ArrowUpCircle } from 'lucide-react';
 import type { LocalProduct, LocalCustomer } from '@/lib/dexie';
 import { CustomerPickerModal, ProductGrid, CartPanel, ShiftSummaryModal, HeldCartsModal, VariantSelectorModal } from '@/components/cashier';
 
@@ -23,12 +23,12 @@ const TransactionHistoryModal = dynamic(() => import('@/components/cashier').the
 const RefundModal = dynamic(() => import('@/components/cashier').then(m => m.RefundModal), { ssr: false });
 
 export default function CashierPage() {
-  const { user, profile, activeStore } = useAuthStore();
+  const { user, profile, activeStore, activeRole } = useAuthStore();
   const { triggerSyncNow } = useSyncEngine();
   const { cart, addToCart, updateQuantity, removeFromCart, clearCart, setCustomerId, setItemDiscount, holdCart, recallCart } = useCartStore();
   const { activeShiftId, initialize, openShift, closeShift, loading: shiftLoading } = useShiftStore();
 
-  const { products, categories, customers, dataLoading } = useCashierData(activeStore?.id);
+  const { products, categories, customers, dataLoading, loadDexieData } = useCashierData(activeStore?.id);
   const {
     subtotal, discount, discountAmount, discountType, total, paymentSplits, tax, taxEnabled, taxRate,
     showPaymentModal, setShowPaymentModal, changeAmount, checkoutError, setCheckoutError, isSubmitting, lastTransaction, setLastTransaction,
@@ -53,10 +53,43 @@ export default function CashierPage() {
 
   const [selectedVariantProduct, setSelectedVariantProduct] = useState<LocalProduct | null>(null);
   const [showVariantModal, setShowVariantModal] = useState(false);
+  const [showCashModal, setShowCashModal] = useState(false);
+  const [cashType, setCashType] = useState<'IN' | 'OUT'>('IN');
+  const [cashAmount, setCashAmount] = useState(0);
+  const [cashReason, setCashReason] = useState('');
 
   const [customerSearch, setCustomerSearch] = useState('');
   const [showCustomerPicker, setShowCustomerPicker] = useState(false);
   const [selectedCustomer, setSelectedCustomer] = useState<LocalCustomer | null>(null);
+  const [customerMembership, setCustomerMembership] = useState<{ points: number; tier: string } | null>(null);
+  const [customerPointsMap, setCustomerPointsMap] = useState<Record<string, { points: number; tier: string }>>({});
+  const [customerCredit, setCustomerCredit] = useState<{ credit_limit: number; current_debt: number } | null>(null);
+
+  const [userPerms, setUserPerms] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (user && activeStore) {
+      db.userPermissions
+        .where('user_id')
+        .equals(user.id)
+        .toArray()
+        .then((perms) => {
+          const map: Record<string, boolean> = {};
+          perms.forEach((p) => {
+            if (p.store_id === activeStore.id) {
+              map[p.permission_key] = p.enabled;
+            }
+          });
+          setUserPerms(map);
+        })
+        .catch((err) => console.warn('Gagal memuat izin akses:', err));
+    }
+  }, [user, activeStore]);
+
+  const hasPermission = (key: string): boolean => {
+    if (activeRole === 'OWNER') return true;
+    return !!userPerms[key];
+  };
 
   const barcodeInputRef = useRef<HTMLInputElement>(null);
   const prevStoreIdRef = useRef<string | null>(null);
@@ -101,6 +134,52 @@ export default function CashierPage() {
   useEffect(() => {
     if (user && activeStore) initialize(user.id, activeStore.id);
   }, [user, activeStore, initialize]);
+
+  // Load memberships for customer points display
+  useEffect(() => {
+    if (!activeStore) return;
+    db.memberships.where('store_id').equals(activeStore.id).toArray().then(members => {
+      const map: Record<string, { points: number; tier: string }> = {};
+      for (const m of members) {
+        map[m.customer_id] = { points: m.points, tier: m.tier };
+      }
+      setCustomerPointsMap(map);
+    }).catch(() => {});
+  }, [activeStore]);
+
+  // Update selected customer's membership and credit when customer changes
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (selectedCustomer && activeStore) {
+        const mem = customerPointsMap[selectedCustomer.id];
+        setCustomerMembership(mem || null);
+        
+        // Calculate current debt
+        db.customerDebts
+          .where('customer_id')
+          .equals(selectedCustomer.id)
+          .filter(d => d.status !== 'PAID')
+          .toArray()
+          .then(debts => {
+            const totalDebt = debts.reduce((sum, d) => sum + d.remaining_amount, 0);
+            setCustomerCredit({
+              credit_limit: selectedCustomer.credit_limit || 0,
+              current_debt: totalDebt,
+            });
+          })
+          .catch(() => {
+            setCustomerCredit({
+              credit_limit: selectedCustomer.credit_limit || 0,
+              current_debt: 0,
+            });
+          });
+      } else {
+        setCustomerMembership(null);
+        setCustomerCredit(null);
+      }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [selectedCustomer, customerPointsMap, activeStore]);
 
   useEffect(() => {
     barcodeInputRef.current?.focus();
@@ -151,6 +230,10 @@ export default function CashierPage() {
 
   const handleVoidCart = () => {
     if (cart.length === 0) return;
+    if (!hasPermission('void_cart')) {
+      useToastStore.getState().addToast('Anda tidak memiliki izin untuk melakukan void keranjang.', 'error');
+      return;
+    }
     setShowVoidConfirm(true);
   };
 
@@ -211,6 +294,32 @@ export default function CashierPage() {
     );
   }
 
+  const handleCashSubmit = async () => {
+    if (!activeStore || !activeShiftId || cashAmount <= 0) return;
+    try {
+      const id = crypto.randomUUID();
+      await db.cashTransactions.add({
+        id,
+        store_id: activeStore.id,
+        shift_id: activeShiftId,
+        type: cashType,
+        amount: cashAmount,
+        reason: cashReason || (cashType === 'IN' ? 'Setoran tunai' : 'Penarikan tunai'),
+        created_at: new Date().toISOString(),
+      });
+      setShowCashModal(false);
+      useToastStore.getState().addToast(
+        cashType === 'IN' ? 'Setoran tunai berhasil dicatat.' : 'Penarikan tunai berhasil dicatat.',
+        'success'
+      );
+    } catch (err: unknown) {
+      useToastStore.getState().addToast(
+        err instanceof Error ? err.message : 'Gagal mencatat transaksi tunai',
+        'error'
+      );
+    }
+  };
+
   return (
     <div className="h-full grid grid-cols-1 md:grid-cols-12 gap-4 md:gap-[24px]">
       <div className="md:col-span-8 flex flex-col min-w-0 space-y-4">
@@ -220,6 +329,12 @@ export default function CashierPage() {
           </button>
           <button onClick={() => setShowHeldCarts(true)} className="h-[48px] px-4 bg-surface border border-hairline rounded-lg text-sm font-semibold text-charcoal hover:bg-surface-muted cursor-pointer whitespace-nowrap flex-shrink-0">
             Hold / Recall
+          </button>
+          <button onClick={() => { setCashType('OUT'); setCashAmount(0); setCashReason(''); setShowCashModal(true); }} className="h-[48px] px-4 bg-warning-soft text-warning border border-warning/20 rounded-lg text-sm font-semibold hover:bg-warning-soft/80 cursor-pointer whitespace-nowrap flex-shrink-0">
+            Tarik Tunai
+          </button>
+          <button onClick={() => { setCashType('IN'); setCashAmount(0); setCashReason(''); setShowCashModal(true); }} className="h-[48px] px-4 bg-success-soft text-success border border-success/20 rounded-lg text-sm font-semibold hover:bg-success-soft/80 cursor-pointer whitespace-nowrap flex-shrink-0">
+            Setor Tunai
           </button>
           <button onClick={() => setShowShiftSummary(true)} className="h-[48px] px-4 bg-danger-soft text-danger border border-danger/20 rounded-lg text-sm font-semibold hover:bg-danger-soft/80 cursor-pointer whitespace-nowrap flex-shrink-0">
             Tutup Shift
@@ -284,9 +399,30 @@ export default function CashierPage() {
         onUpdateQuantity={handleUpdateQuantity}
         onRemoveFromCart={removeFromCart}
         onClearCart={handleVoidCart}
-        onDiscountChange={(v) => { setDiscountInput(v); setDiscount(parseFloat(v) || 0); }}
-        onDiscountTypeChange={(type) => { setDiscountInput(''); setDiscount(0); setDiscountType(type); }}
-        onItemDiscountChange={setItemDiscount}
+        onDiscountChange={(v) => {
+          if (!hasPermission('apply_discount')) {
+            useToastStore.getState().addToast('Anda tidak memiliki izin untuk menerapkan diskon.', 'error');
+            return;
+          }
+          setDiscountInput(v);
+          setDiscount(parseFloat(v) || 0);
+        }}
+        onDiscountTypeChange={(type) => {
+          if (!hasPermission('apply_discount')) {
+            useToastStore.getState().addToast('Anda tidak memiliki izin untuk menerapkan diskon.', 'error');
+            return;
+          }
+          setDiscountInput('');
+          setDiscount(0);
+          setDiscountType(type);
+        }}
+        onItemDiscountChange={(cartItemId, val) => {
+          if (!hasPermission('apply_discount')) {
+            useToastStore.getState().addToast('Anda tidak memiliki izin untuk menerapkan diskon item.', 'error');
+            return;
+          }
+          setItemDiscount(cartItemId, val);
+        }}
         onCustomerPickerOpen={() => setShowCustomerPicker(true)}
         onCustomerRemove={() => { setSelectedCustomer(null); setCustomerId(null); }}
         onPaymentOpen={() => setShowPaymentModal(true)}
@@ -294,13 +430,22 @@ export default function CashierPage() {
 
       {showPaymentModal && (
         <PaymentModal total={total} paymentSplits={paymentSplits} changeAmount={changeAmount} checkoutError={checkoutError} isSubmitting={isSubmitting}
+          customerPoints={customerMembership}
+          customerCredit={customerCredit}
           onClose={() => { setShowPaymentModal(false); setCheckoutError(null); }}
           onSplitChange={handlePaymentSplitChange} onSubmit={handleCheckoutSubmit}
         />
       )}
 
-      <CustomerPickerModal show={showCustomerPicker} customers={customers} search={customerSearch}
-        onClose={() => setShowCustomerPicker(false)} onSearchChange={setCustomerSearch}
+      <CustomerPickerModal
+        show={showCustomerPicker}
+        customers={customers}
+        search={customerSearch}
+        memberships={customerPointsMap}
+        storeId={activeStore?.id}
+        onCustomerAdded={loadDexieData}
+        onClose={() => setShowCustomerPicker(false)}
+        onSearchChange={setCustomerSearch}
         onSelect={(c) => { setSelectedCustomer(c); setCustomerId(c.id); setShowCustomerPicker(false); setCustomerSearch(''); }}
       />
 
@@ -365,6 +510,43 @@ export default function CashierPage() {
             }
           }}
         />
+      )}
+
+      {showCashModal && (
+        <div className="fixed inset-0 z-50 bg-overlay flex items-center justify-center p-4" onClick={() => setShowCashModal(false)} onKeyDown={(e) => { if (e.key === 'Escape') setShowCashModal(false); }}>
+          <div className="bg-surface rounded-xl border border-hairline max-w-sm w-full p-6 space-y-4 shadow-floating" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-3" style={cashType === 'IN' ? { color: '#16a34a' } : { color: '#dc2626' }}>
+              {cashType === 'IN' ? <ArrowDownCircle className="w-6 h-6" /> : <ArrowUpCircle className="w-6 h-6" />}
+              <h3 className="font-sans font-bold text-lg text-ink">{cashType === 'IN' ? 'Setor Tunai' : 'Tarik Tunai'}</h3>
+            </div>
+            <div>
+              <label className="block text-sm font-semibold text-charcoal mb-1">Jumlah (Rp)</label>
+              <input
+                type="number"
+                value={cashAmount || ''}
+                onChange={e => setCashAmount(Number(e.target.value))}
+                placeholder="Masukkan jumlah"
+                className="w-full bg-surface border border-hairline rounded-lg px-4 h-[48px] text-[15px] font-semibold font-mono focus:outline-none focus:border-primary"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-semibold text-charcoal mb-1">Keterangan (opsional)</label>
+              <input
+                type="text"
+                value={cashReason}
+                onChange={e => setCashReason(e.target.value)}
+                placeholder={cashType === 'IN' ? 'Contoh: Setoran awal shift' : 'Contoh: Ambil untuk belanja'}
+                className="w-full bg-surface border border-hairline rounded-lg px-4 h-[48px] text-[15px] focus:outline-none focus:border-primary"
+              />
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => setShowCashModal(false)} className="flex-1 h-[48px] rounded-lg border border-hairline text-charcoal font-semibold text-sm hover:bg-canvas cursor-pointer">Batal</button>
+              <button onClick={handleCashSubmit} disabled={cashAmount <= 0} className="flex-1 h-[48px] rounded-lg bg-primary text-on-primary font-semibold text-sm hover:opacity-90 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">
+                {cashType === 'IN' ? 'Setor' : 'Tarik'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

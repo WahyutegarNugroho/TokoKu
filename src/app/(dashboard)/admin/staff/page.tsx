@@ -3,7 +3,8 @@
 import React, { useState, useEffect, useCallback, startTransition } from 'react';
 import { useAuthStore } from '@/store/authStore';
 import { useToastStore } from '@/store/toastStore';
-import { invitesApi, membersApi, activityApi } from '@/lib/api';
+import { invitesApi, membersApi, activityApi, userPermissionsApi } from '@/lib/api';
+import { db } from '@/lib/dexie';
 import ConfirmModal from '@/components/ConfirmModal';
 import { StaffTab } from '@/components/admin';
 import { type StoreMember, type Invite, type MemberRow } from '@/types';
@@ -19,6 +20,8 @@ export default function StaffPage() {
   const [inviteExpiry, setInviteExpiry] = useState('');
   const [generatingInvite, setGeneratingInvite] = useState(false);
   const [inviteCooldown, setInviteCooldown] = useState(false);
+
+  const [permissions, setPermissions] = useState<Record<string, Record<string, boolean>>>({});
 
   const [confirm, setConfirm] = useState<{ title: string; message: string; danger?: boolean; onConfirm: () => void } | null>(null);
 
@@ -47,6 +50,29 @@ export default function StaffPage() {
       });
       setMembers(mapped);
 
+      // Load permissions
+      const localPerms = await db.userPermissions.where('store_id').equals(activeStore.id).toArray();
+      const permMap: Record<string, Record<string, boolean>> = {};
+      for (const p of localPerms) {
+        if (!permMap[p.user_id]) permMap[p.user_id] = {};
+        permMap[p.user_id][p.permission_key] = p.enabled;
+      }
+      
+      // Load remote permissions if online
+      if (navigator.onLine) {
+        const { data: remotePerms } = await userPermissionsApi.list(activeStore.id);
+        if (remotePerms) {
+          await db.transaction('rw', db.userPermissions, async () => {
+            await db.userPermissions.bulkPut(remotePerms);
+          });
+          for (const p of remotePerms) {
+            if (!permMap[p.user_id]) permMap[p.user_id] = {};
+            permMap[p.user_id][p.permission_key] = p.enabled;
+          }
+        }
+      }
+      setPermissions(permMap);
+
       const { data: inviteData, error: inviteError } = await invitesApi.list(activeStore.id);
       if (!inviteError && inviteData?.success) {
         const raw = inviteData.invites;
@@ -56,6 +82,18 @@ export default function StaffPage() {
       useToastStore.getState().addToast(err instanceof Error ? err.message : 'Gagal memuat data.', 'error');
     }
   }, [activeStore]);
+
+  const togglePermission = async (userId: string, key: string, currentEnabled: boolean) => {
+    if (!activeStore) return;
+    try {
+      const nextEnabled = !currentEnabled;
+      await userPermissionsApi.update(activeStore.id, userId, key, nextEnabled);
+      useToastStore.getState().addToast('Izin akses berhasil diubah.', 'success');
+      loadData();
+    } catch {
+      useToastStore.getState().addToast('Gagal mengubah izin.', 'error');
+    }
+  };
 
   useEffect(() => {
     if (activeStore) {
@@ -190,6 +228,8 @@ export default function StaffPage() {
         onInviteRoleChange={setInviteRole}
         onInviteMaxUsesChange={setInviteMaxUses}
         onInviteExpiryChange={setInviteExpiry}
+        permissions={permissions}
+        onTogglePermission={togglePermission}
       />
 
       {confirm && (

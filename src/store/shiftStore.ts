@@ -19,9 +19,10 @@ interface ShiftState {
   initialize: (userId: string, storeId: string) => Promise<void>;
   /**
    * Open a new shift — saves to Dexie immediately, attempts Supabase sync if online.
+   * @param beginningCash - Initial cash amount in the drawer at shift start
    * @returns The new shift ID
    */
-  openShift: (userId: string, storeId: string) => Promise<string>;
+  openShift: (userId: string, storeId: string, beginningCash?: number) => Promise<string>;
   /**
    * Close the active shift — updates Dexie immediately, attempts Supabase sync if online.
    * Does nothing if no shift is active.
@@ -55,6 +56,7 @@ export const useShiftStore = create<ShiftState>((set, get) => ({
                 user_id: data.user_id,
                 start_time: data.start_time,
                 end_time: data.end_time || null,
+                beginning_cash: data.beginning_cash || 0,
                 status: data.status
               });
               set({ activeShiftId: data.id });
@@ -71,7 +73,12 @@ export const useShiftStore = create<ShiftState>((set, get) => ({
     }
   },
 
-  openShift: async (userId: string, storeId: string) => {
+  /**
+   * Open a new shift — saves to Dexie immediately, attempts Supabase sync if online.
+   * @param beginningCash - Initial cash amount in the drawer at shift start
+   * @returns The new shift ID
+   */
+  openShift: async (userId: string, storeId: string, beginningCash = 0) => {
     set({ loading: true });
     try {
       const shiftId = crypto.randomUUID();
@@ -80,13 +87,14 @@ export const useShiftStore = create<ShiftState>((set, get) => ({
         store_id: storeId,
         user_id: userId,
         start_time: new Date().toISOString(),
+        beginning_cash: beginningCash,
         status: 'OPEN' as const
       };
 
       await db.shifts.put(newShift);
 
       if (navigator.onLine) {
-        await dataService.shifts.createShift(shiftId, storeId, userId, newShift.start_time);
+        await dataService.shifts.createShift(shiftId, storeId, userId, newShift.start_time, beginningCash);
       }
 
       set({ activeShiftId: shiftId });

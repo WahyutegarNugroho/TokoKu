@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Coins, CreditCard, QrCode, RefreshCw, Wallet, Landmark, FileText } from 'lucide-react';
+import { Coins, CreditCard, QrCode, RefreshCw, Wallet, Landmark, FileText, Star } from 'lucide-react';
 import RupiahInput from '@/components/RupiahInput';
 import { useFocusTrap } from '@/hooks/useFocusTrap';
 
@@ -16,10 +16,25 @@ interface PaymentModalProps {
   changeAmount: number | null;
   checkoutError: string | null;
   isSubmitting: boolean;
+  customerPoints: { points: number; tier: string } | null;
+  customerCredit?: { credit_limit: number; current_debt: number } | null;
   onClose: () => void;
   onSplitChange: (method: 'CASH' | 'DEBIT' | 'QRIS' | 'EWALLET' | 'TRANSFER' | 'CREDIT' | 'DEBT', value: number) => void;
   onSubmit: () => void;
 }
+
+const POINTS_RATE = 100; // 100 points = Rp 1,000
+const POINTS_DISCOUNT = 1000; // discount per POINTS_RATE
+
+const tierLabel: Record<string, string> = {
+  BRONZE: 'Bronze', SILVER: 'Silver', GOLD: 'Gold',
+};
+
+const tierBadge: Record<string, string> = {
+  BRONZE: 'bg-amber-100 text-amber-800',
+  SILVER: 'bg-slate-200 text-slate-700',
+  GOLD: 'bg-yellow-300 text-yellow-900',
+};
 
 export default function PaymentModal({
   total,
@@ -27,15 +42,21 @@ export default function PaymentModal({
   changeAmount,
   checkoutError,
   isSubmitting,
+  customerPoints,
+  customerCredit,
   onClose,
   onSplitChange,
   onSubmit,
 }: PaymentModalProps) {
   const focusRef = useFocusTrap(true);
 
-  // Local state for tracking bank and e-wallet selections
   const [selectedWallet, setSelectedWallet] = useState('GoPay');
   const [selectedBank, setSelectedBank] = useState('BCA');
+  const [redeemPoints, setRedeemPoints] = useState(0);
+
+  const pointsDiscount = customerPoints ? Math.floor(redeemPoints / POINTS_RATE) * POINTS_DISCOUNT : 0;
+  const effectiveTotal = Math.max(0, total - pointsDiscount);
+  const displayTotal = pointsDiscount > 0 ? effectiveTotal : total;
 
   return (
     <div ref={focusRef} className="fixed inset-0 bg-ink/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -66,6 +87,38 @@ export default function PaymentModal({
             </h4>
           </div>
 
+          {/* Points Redemption */}
+          {customerPoints && (
+            <div className="p-3 border border-hairline rounded-xl bg-surface">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2 text-sm font-semibold text-charcoal">
+                  <Star className="w-4 h-4 text-yellow-500" />
+                  Poin Anda: {customerPoints.points} pts
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${tierBadge[customerPoints.tier] || ''}`}>
+                    {tierLabel[customerPoints.tier] || customerPoints.tier}
+                  </span>
+                </div>
+              </div>
+              {customerPoints.points >= POINTS_RATE && (
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number" min={0} max={customerPoints.points} step={POINTS_RATE}
+                    value={redeemPoints || ''}
+                    onChange={e => setRedeemPoints(Math.min(Number(e.target.value), customerPoints.points))}
+                    placeholder="Tukar poin..."
+                    className="flex-1 bg-canvas border border-hairline rounded-lg px-3 h-[40px] text-sm focus:outline-none focus:border-primary"
+                  />
+                  {pointsDiscount > 0 && (
+                    <span className="text-xs text-success font-semibold font-mono whitespace-nowrap">-Rp {pointsDiscount.toLocaleString('id-ID')}</span>
+                  )}
+                </div>
+              )}
+              {pointsDiscount > 0 && (
+                <p className="text-xs text-success mt-1 font-sans">Total setelah poin: <span className="font-mono font-semibold">Rp {effectiveTotal.toLocaleString('id-ID')}</span></p>
+              )}
+            </div>
+          )}
+
           {(['CASH', 'DEBIT', 'QRIS', 'EWALLET', 'TRANSFER', 'CREDIT', 'DEBT'] as const).map((method) => {
             const split = paymentSplits.find((s) => s.method === method);
             const amount = split?.amount || 0;
@@ -90,7 +143,7 @@ export default function PaymentModal({
               DEBT: 'Piutang',
             };
 
-            return (
+          return (
               <div key={method} className="flex flex-col gap-2 p-3 border border-hairline rounded-xl bg-surface">
                 <div className="flex items-center gap-3">
                   <div className="flex items-center gap-2 w-28 font-sans font-semibold text-sm text-charcoal">
@@ -106,7 +159,6 @@ export default function PaymentModal({
                   />
                 </div>
 
-                {/* Suboptions for specific payment methods */}
                 {method === 'EWALLET' && amount > 0 && (
                   <div className="flex items-center justify-between text-xs mt-1 border-t border-hairline-soft pt-2">
                     <span className="text-slate font-sans">Pilih E-Wallet:</span>
@@ -142,8 +194,28 @@ export default function PaymentModal({
                 )}
 
                 {method === 'DEBT' && amount > 0 && (
-                  <div className="text-[11px] text-orange-600 bg-orange-50 border border-orange-200 rounded p-2 font-sans">
-                    ⚠️ Transaksi piutang mewajibkan kasir memilih pelanggan di panel keranjang sebelum checkout.
+                  <div className="space-y-2 text-[11px] font-sans">
+                    <div className="text-orange-600 bg-orange-50 border border-orange-200 rounded p-2">
+                      ⚠️ Transaksi piutang mewajibkan kasir memilih pelanggan di panel keranjang sebelum checkout.
+                    </div>
+                    {customerCredit && customerCredit.credit_limit > 0 && (
+                      <div className="bg-canvas border border-hairline rounded p-2 space-y-1">
+                        <div className="flex justify-between">
+                          <span className="text-slate">Limit Kredit:</span>
+                          <span className="font-mono font-semibold text-charcoal">Rp {customerCredit.credit_limit.toLocaleString('id-ID')}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate">Utang Sekarang:</span>
+                          <span className="font-mono font-semibold text-charcoal">Rp {customerCredit.current_debt.toLocaleString('id-ID')}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate">Sisa Limit:</span>
+                          <span className={`font-mono font-semibold ${(customerCredit.credit_limit - customerCredit.current_debt - amount) < 0 ? 'text-danger' : 'text-success'}`}>
+                            Rp {(customerCredit.credit_limit - customerCredit.current_debt - amount).toLocaleString('id-ID')}
+                          </span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -151,7 +223,7 @@ export default function PaymentModal({
                   <div className="flex gap-1.5 flex-wrap justify-end pt-1">
                     <button
                       type="button"
-                      onClick={() => onSplitChange('CASH', total)}
+                      onClick={() => onSplitChange('CASH', displayTotal)}
                       className="bg-canvas border border-hairline text-[11px] font-semibold px-2 py-1.5 rounded-lg text-charcoal hover:bg-surface-muted cursor-pointer"
                     >
                       Uang Pas
@@ -168,7 +240,7 @@ export default function PaymentModal({
                     ))}
                     <button
                       type="button"
-                      onClick={() => onSplitChange('CASH', Math.ceil(total / 10000) * 10000)}
+                      onClick={() => onSplitChange('CASH', Math.ceil(displayTotal / 10000) * 10000)}
                       className="bg-canvas border border-hairline text-[11px] font-semibold px-2 py-1.5 rounded-lg text-charcoal hover:bg-surface-muted cursor-pointer"
                     >
                       Mulai 10rb
@@ -192,7 +264,7 @@ export default function PaymentModal({
                   Rp{' '}
                   {Math.max(
                     0,
-                    total - paymentSplits.reduce((s, p) => s + (p.amount || 0), 0)
+                    displayTotal - paymentSplits.reduce((s, p) => s + (p.amount || 0), 0)
                   ).toLocaleString('id-ID')}
                 </span>
               </div>

@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import { db } from '@/lib/dexie';
 import { categoriesApi } from '@/lib/api';
 import { useToastStore } from '@/store/toastStore';
 import ConfirmModal from '@/components/ConfirmModal';
@@ -26,8 +27,24 @@ export default function CategoryManager({ storeId, onActivityLog }: CategoryMana
     if (!storeId) return;
     setLoading(true);
     try {
-      const { data } = await categoriesApi.list(storeId);
-      setCategories(data || []);
+      // Read from Dexie first (offline-first)
+      const local = await db.categories.where('store_id').equals(storeId).toArray();
+      if (local.length > 0) {
+        setCategories(local.map(c => ({ id: c.id, name: c.name, description: c.description || '' })));
+      }
+      // Refresh from Supabase if online
+      if (navigator.onLine) {
+        const { data } = await categoriesApi.list(storeId);
+        if (data) {
+          // Persist to Dexie for offline use
+          await db.transaction('rw', db.categories, async () => {
+            for (const cat of data) {
+              await db.categories.put({ id: cat.id, store_id: cat.store_id, name: cat.name, description: cat.description || undefined });
+            }
+          });
+          setCategories(data.map(c => ({ id: c.id, name: c.name, description: c.description || '' })));
+        }
+      }
     } catch (err) { useToastStore.getState().addToast(err instanceof Error ? err.message : 'Terjadi kesalahan', 'error'); }
     finally { setLoading(false); }
   }, [storeId]);

@@ -280,18 +280,11 @@ export const useCartStore = create<CartState>()(
     }
 
     // Validate payment splits
+    const valErr = validatePaymentSplits(paymentSplits, total);
+    if (valErr) {
+      throw new Error(valErr);
+    }
     const nonZeroSplits = paymentSplits.filter(s => s.amount > 0);
-    if (nonZeroSplits.length === 0) {
-      throw new Error('Pilih minimal satu metode pembayaran.');
-    }
-    const nonCashTotal = paymentSplits.filter(s => s.method !== 'CASH').reduce((a, b) => a + (b.amount || 0), 0);
-    if (nonCashTotal > total) {
-      throw new Error('Jumlah pembayaran non-tunai melebihi total tagihan.');
-    }
-    const splitSum = paymentSplits.reduce((sum, s) => sum + (s.amount || 0), 0);
-    if (splitSum < total) {
-      throw new Error('Jumlah pembayaran kurang dari total tagihan.');
-    }
 
     // Determine payment method: 'SPLIT' if multiple methods used
     const primaryMethod = nonZeroSplits.length > 1
@@ -302,6 +295,32 @@ export const useCartStore = create<CartState>()(
     const hasDebt = nonZeroSplits.some(s => s.method === 'DEBT') || primaryMethod === 'DEBT';
     if (hasDebt && !customerId) {
       throw new Error('Transaksi piutang (hutang) wajib memilih pelanggan.');
+    }
+
+    // Validate credit limit for DEBT transactions
+    if (hasDebt && customerId) {
+      const debtSplit = nonZeroSplits.find(s => s.method === 'DEBT');
+      const debtAmount = debtSplit ? debtSplit.amount : (primaryMethod === 'DEBT' ? total : 0);
+      
+      if (debtAmount > 0) {
+        const customer = await db.customers.get(customerId);
+        if (customer && customer.credit_limit > 0) {
+          const existingDebts = await db.customerDebts
+            .where('customer_id').equals(customerId)
+            .filter(d => d.status !== 'PAID')
+            .toArray();
+          const totalExistingDebt = existingDebts.reduce((sum, d) => sum + d.remaining_amount, 0);
+          const totalDebtAfter = totalExistingDebt + debtAmount;
+          
+          if (totalDebtAfter > customer.credit_limit) {
+            throw new Error(
+              `Limit kredit customer habis. Limit: Rp ${customer.credit_limit.toLocaleString('id-ID')}, ` +
+              `Utang sekarang: Rp ${totalExistingDebt.toLocaleString('id-ID')}, ` +
+              `Transaksi ini: Rp ${debtAmount.toLocaleString('id-ID')}`
+            );
+          }
+        }
+      }
     }
 
     const transactionId = crypto.randomUUID();
@@ -376,6 +395,35 @@ export const useCartStore = create<CartState>()(
             if (prod.stock < item.quantity) {
               throw new Error(`Stok ${prod.name} tidak cukup saat checkout`);
             }
+            // Deduct from batches using FEFO
+            const batches = await db.productBatches
+              .where('product_id').equals(item.product_id)
+              .toArray();
+            if (batches.length > 0) {
+              batches.sort((a, b) => a.expiry_date.localeCompare(b.expiry_date));
+              let remainingToDeduct = item.quantity;
+              for (const batch of batches) {
+                if (remainingToDeduct <= 0) break;
+                const deductQty = Math.min(batch.quantity, remainingToDeduct);
+                if (deductQty > 0) {
+                  batch.quantity -= deductQty;
+                  remainingToDeduct -= deductQty;
+                  await db.productBatches.put(batch);
+                  await db.pendingOps.add({
+                    id: crypto.randomUUID(),
+                    store_id: storeId,
+                    table: 'product_batches',
+                    operation: 'CREATE',
+                    record_id: batch.id,
+                    payload: { product_id: batch.product_id, batch_no: batch.batch_no, expiry_date: batch.expiry_date, quantity: batch.quantity },
+                    created_at: new Date().toISOString(),
+                    retry_count: 0,
+                    sync_status: false,
+                  });
+                }
+              }
+            }
+
             prod.stock = Math.max(0, prod.stock - item.quantity);
             await db.products.put(prod);
             broadcast({ type: 'STOCK_UPDATE', payload: { productId: item.product_id, newStock: prod.stock } });
@@ -405,6 +453,25 @@ export const useCartStore = create<CartState>()(
           sync_status: false,
           created_at: new Date().toISOString(),
         });
+
+        // Award loyalty points (1 point per Rp 1,000 spent)
+        if (customerId) {
+          const pointsEarned = Math.floor(total / 1000);
+          if (pointsEarned > 0) {
+            const existing = await db.memberships.where('customer_id').equals(customerId).first();
+            if (existing) {
+              const newPoints = existing.points + pointsEarned;
+              const newTier = newPoints >= 1000 ? 'GOLD' as const : newPoints >= 500 ? 'SILVER' as const : existing.tier;
+              await db.memberships.update(existing.id, { points: newPoints, tier: newTier });
+            } else {
+              const newTier = pointsEarned >= 1000 ? 'GOLD' as const : pointsEarned >= 500 ? 'SILVER' as const : 'BRONZE' as const;
+              await db.memberships.add({
+                id: crypto.randomUUID(), store_id: storeId, customer_id: customerId,
+                points: pointsEarned, tier: newTier,
+              });
+            }
+          }
+        }
       });
 
       get().clearCart();
@@ -525,3 +592,19 @@ export const useCartStore = create<CartState>()(
     }
   )
 );
+
+export function validatePaymentSplits(paymentSplits: PaymentSplit[], total: number): string | null {
+  const nonZeroSplits = paymentSplits.filter(s => s.amount > 0);
+  if (nonZeroSplits.length === 0) {
+    return 'Pilih minimal satu metode pembayaran.';
+  }
+  const nonCashTotal = paymentSplits.filter(s => s.method !== 'CASH').reduce((a, b) => a + (b.amount || 0), 0);
+  if (nonCashTotal > total) {
+    return 'Jumlah pembayaran non-tunai melebihi total tagihan.';
+  }
+  const splitSum = paymentSplits.reduce((sum, s) => sum + (s.amount || 0), 0);
+  if (splitSum < total) {
+    return 'Jumlah pembayaran kurang dari total tagihan.';
+  }
+  return null;
+}

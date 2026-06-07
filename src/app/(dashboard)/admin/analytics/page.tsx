@@ -76,18 +76,28 @@ export default function AnalyticsPage() {
 
       if (navigator.onLine) {
         try {
+          // Fetch headers only (no items) to calculate totals
           let query = supabase
             .from('transactions')
-            .select('*, transaction_items(*)')
+            .select('id, store_id, shift_id, total_amount, tax, discount, customer_id, payment_method, status, created_at')
             .eq('store_id', activeStore.id);
           if (dateFilter) query = query.gte('created_at', dateFilter);
           const { data: serverTxs, error: txError } = await query;
 
           if (txError) throw txError;
 
-          if (serverTxs && serverTxs.length > 0) {
-            const supabaseTxs = serverTxs as unknown as SupabaseTx[];
-            txs = supabaseTxs.map((t) => ({
+          // Fetch recent 15 transactions WITH items
+          const { data: recentTxs, error: recentError } = await supabase
+            .from('transactions')
+            .select('*, transaction_items(*)')
+            .eq('store_id', activeStore.id)
+            .order('created_at', { ascending: false })
+            .limit(15);
+
+          if (recentError) throw recentError;
+
+          if (serverTxs) {
+            txs = serverTxs.map((t) => ({
               id: t.id,
               store_id: t.store_id,
               shift_id: t.shift_id,
@@ -101,7 +111,9 @@ export default function AnalyticsPage() {
               sync_status: true,
             }));
 
-            filteredItems = supabaseTxs.flatMap((t) =>
+            // Collect items from the recent transactions only
+            const supabaseRecent = (recentTxs || []) as unknown as SupabaseTx[];
+            filteredItems = supabaseRecent.flatMap((t) =>
               (t.transaction_items || []).map((ti) => ({
                 id: ti.id,
                 transaction_id: ti.transaction_id,
@@ -121,9 +133,10 @@ export default function AnalyticsPage() {
       if (!txs || !filteredItems) {
         const localTxs = await db.transactions.where('store_id').equals(activeStore.id).toArray();
         txs = dateFilter ? localTxs.filter((t) => t.created_at >= dateFilter) : localTxs;
-        const txIds = new Set(txs.map((t) => t.id));
+        const recentTxs = [...txs].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 15);
+        const recentTxIds = new Set(recentTxs.map(t => t.id));
         const allItems = await db.transactionItems.toArray();
-        filteredItems = allItems.filter((item) => txIds.has(item.transaction_id));
+        filteredItems = allItems.filter((item) => recentTxIds.has(item.transaction_id));
       }
 
       const currentTxIds = new Set(txs.map((t) => t.id));

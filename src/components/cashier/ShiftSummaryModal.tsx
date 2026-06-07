@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { RefreshCw, Printer, AlertCircle } from 'lucide-react';
+import { RefreshCw, Printer, AlertCircle, ArrowDownCircle, ArrowUpCircle } from 'lucide-react';
 import { db } from '@/lib/dexie';
 import { escapeHtml } from '@/lib/utils';
 import { useToastStore } from '@/store/toastStore';
@@ -22,6 +22,9 @@ interface ShiftStats {
   debitTotal: number;
   qrisTotal: number;
   splitTotal: number;
+  beginningCash: number;
+  cashIn: number;
+  cashOut: number;
 }
 
 export default function ShiftSummaryModal({
@@ -40,49 +43,57 @@ export default function ShiftSummaryModal({
   useEffect(() => {
     if (!show || !activeShiftId) return;
 
-    async function loadStats() {
-      setLoading(true);
-      try {
-        const txs = await db.transactions.where('shift_id').equals(activeShiftId).toArray();
-        const txIds = txs.map(t => t.id);
-        const splits = await db.paymentSplits.where('transaction_id').anyOf(txIds).toArray();
+      async function loadStats() {
+        setLoading(true);
+        try {
+          const txs = await db.transactions.where('shift_id').equals(activeShiftId).toArray();
+          const txIds = txs.map(t => t.id);
+          const splits = await db.paymentSplits.where('transaction_id').anyOf(txIds).toArray();
+          const shift = await db.shifts.get(activeShiftId);
+          const cashTxs = await db.cashTransactions.where('shift_id').equals(activeShiftId).toArray();
 
-        let salesTotal = 0;
-        let txCount = 0;
-        let cashTotal = 0;
-        let debitTotal = 0;
-        let qrisTotal = 0;
-        let splitTotal = 0;
+          let salesTotal = 0;
+          let txCount = 0;
+          let cashTotal = 0;
+          let debitTotal = 0;
+          let qrisTotal = 0;
+          let splitTotal = 0;
 
-        txs.forEach((t) => {
-          if (t.status === 'REFUNDED' || t.status === 'VOIDED') return;
-          salesTotal += t.total_amount;
-          txCount++;
+          txs.forEach((t) => {
+            if (t.status === 'REFUNDED' || t.status === 'VOIDED') return;
+            salesTotal += t.total_amount;
+            txCount++;
 
-          if (t.payment_method === 'CASH') cashTotal += t.total_amount;
-          else if (t.payment_method === 'DEBIT') debitTotal += t.total_amount;
-          else if (t.payment_method === 'QRIS') qrisTotal += t.total_amount;
-          else if (t.payment_method === 'SPLIT') splitTotal += t.total_amount;
-        });
+            if (t.payment_method === 'CASH') cashTotal += t.total_amount;
+            else if (t.payment_method === 'DEBIT') debitTotal += t.total_amount;
+            else if (t.payment_method === 'QRIS') qrisTotal += t.total_amount;
+            else if (t.payment_method === 'SPLIT') splitTotal += t.total_amount;
+          });
 
-        // Add split amounts to totals
-        splits.forEach((s) => {
-          const relatedTx = txs.find(t => t.id === s.transaction_id);
-          if (!relatedTx || relatedTx.status === 'REFUNDED' || relatedTx.status === 'VOIDED') return;
+          splits.forEach((s) => {
+            const relatedTx = txs.find(t => t.id === s.transaction_id);
+            if (!relatedTx || relatedTx.status === 'REFUNDED' || relatedTx.status === 'VOIDED') return;
 
-          if (s.method === 'CASH') cashTotal += s.amount;
-          else if (s.method === 'DEBIT') debitTotal += s.amount;
-          else if (s.method === 'QRIS') qrisTotal += s.amount;
-        });
+            if (s.method === 'CASH') cashTotal += s.amount;
+            else if (s.method === 'DEBIT') debitTotal += s.amount;
+            else if (s.method === 'QRIS') qrisTotal += s.amount;
+          });
 
-        setStats({
-          salesTotal,
-          txCount,
-          cashTotal,
-          debitTotal,
-          qrisTotal,
-          splitTotal,
-        });
+          const beginningCash = shift?.beginning_cash || 0;
+          const cashIn = cashTxs.filter(c => c.type === 'IN').reduce((sum, c) => sum + c.amount, 0);
+          const cashOut = cashTxs.filter(c => c.type === 'OUT').reduce((sum, c) => sum + c.amount, 0);
+
+          setStats({
+            salesTotal,
+            txCount,
+            cashTotal,
+            debitTotal,
+            qrisTotal,
+            splitTotal,
+            beginningCash,
+            cashIn,
+            cashOut,
+          });
       } catch (err) {
         console.error('Error computing shift statistics:', err);
         useToastStore.getState().addToast('Gagal menghitung rekap shift.', 'error');
@@ -97,7 +108,7 @@ export default function ShiftSummaryModal({
   if (!show) return null;
 
   const actualCash = parseFloat(actualCashInput) || 0;
-  const expectedCash = stats ? stats.cashTotal : 0;
+  const expectedCash = stats ? stats.beginningCash + stats.cashTotal + stats.cashIn - stats.cashOut : 0;
   const difference = actualCash - expectedCash;
 
   const handlePrintReport = () => {
@@ -204,6 +215,27 @@ export default function ShiftSummaryModal({
                   <span>QRIS</span>
                   <span className="font-mono font-semibold">Rp {stats.qrisTotal.toLocaleString('id-ID')}</span>
                 </div>
+              </div>
+
+              {/* Cash Management Summary */}
+              <div className="bg-canvas border border-hairline p-4 rounded-lg space-y-2">
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate font-sans mb-2">Manajemen Kas</h4>
+                <div className="flex justify-between text-sm text-charcoal font-sans">
+                  <span>Saldo Awal</span>
+                  <span className="font-mono font-semibold">Rp {stats.beginningCash.toLocaleString('id-ID')}</span>
+                </div>
+                {stats.cashIn > 0 && (
+                  <div className="flex justify-between text-sm text-success font-sans">
+                    <span className="flex items-center gap-1"><ArrowDownCircle className="w-3.5 h-3.5" />Setoran</span>
+                    <span className="font-mono font-semibold">+Rp {stats.cashIn.toLocaleString('id-ID')}</span>
+                  </div>
+                )}
+                {stats.cashOut > 0 && (
+                  <div className="flex justify-between text-sm text-danger font-sans">
+                    <span className="flex items-center gap-1"><ArrowUpCircle className="w-3.5 h-3.5" />Penarikan</span>
+                    <span className="font-mono font-semibold">-Rp {stats.cashOut.toLocaleString('id-ID')}</span>
+                  </div>
+                )}
               </div>
 
               {/* Expected vs Actual Cash Drawer Input */}

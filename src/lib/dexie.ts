@@ -7,6 +7,18 @@ export interface LocalCategory {
   description?: string;
 }
 
+export interface LocalPromotion {
+  id: string;
+  store_id: string;
+  name: string;
+  description?: string;
+  type: 'PERCENT' | 'FIXED'; // PERCENT (0-100) or FIXED amount
+  value: number;
+  start_date: string; // ISO timestamp
+  end_date: string; // ISO timestamp
+  enabled: boolean;
+}
+
 export interface LocalProduct {
   id: string;
   store_id: string;
@@ -24,6 +36,7 @@ export interface LocalShift {
   user_id: string;
   start_time: string;
   end_time?: string;
+  beginning_cash: number;
   status: 'OPEN' | 'CLOSED';
 }
 
@@ -60,6 +73,7 @@ export interface LocalCustomer {
   name: string;
   phone: string;
   email: string;
+  credit_limit: number;
   created_at: string;
 }
 
@@ -70,6 +84,16 @@ export interface LocalActivityLog {
   action: string;
   description: string;
   sync_status?: boolean;
+  created_at: string;
+}
+
+export interface LocalCashTransaction {
+  id: string;
+  store_id: string;
+  shift_id: string;
+  type: 'IN' | 'OUT';
+  amount: number;
+  reason: string;
   created_at: string;
 }
 
@@ -94,7 +118,7 @@ export interface LocalPaymentSplit {
 export interface LocalReturn {
   id: string;
   store_id: string;
-  transaction_id: string;
+  transaction_id: string | null; // Nullable: returns without transactions (e.g., supplier returns)
   user_id: string;
   items: { product_id: string; quantity: number; refund_amount: number }[];
   reason: string;
@@ -144,6 +168,18 @@ export interface LocalCustomerDebt {
   updated_at?: string;
 }
 
+export interface LocalDebtPayment {
+  id: string;
+  store_id: string;
+  debt_id: string;
+  amount: number;
+  payment_method: 'CASH' | 'TRANSFER' | 'CARD' | 'OTHER';
+  paid_at: string;
+  notes?: string;
+  created_at: string;
+  sync_status: boolean;
+}
+
 export interface LocalSupplier {
   id: string;
   store_id: string;
@@ -160,6 +196,16 @@ export interface LocalPurchaseOrder {
   total_amount: number;
   status: 'PENDING' | 'RECEIVED' | 'CANCELLED';
   created_at: string;
+}
+
+export interface LocalPurchaseOrderItem {
+  id: string;
+  store_id: string;
+  purchase_order_id: string;
+  product_id: string;
+  quantity: number;
+  unit_price: number;
+  subtotal: number;
 }
 
 export interface LocalKitchenOrder {
@@ -182,7 +228,7 @@ export interface LocalMembership {
 export interface LocalPendingOp {
   id: string;
   store_id: string;
-  table: 'categories' | 'products' | 'customers';
+  table: 'categories' | 'products' | 'customers' | 'debt_payments' | 'suppliers' | 'purchase_orders' | 'product_batches' | 'warehouses' | 'warehouse_stocks' | 'user_permissions';
   operation: 'CREATE' | 'UPDATE' | 'DELETE';
   record_id: string;
   payload: unknown;
@@ -191,8 +237,43 @@ export interface LocalPendingOp {
   sync_status: boolean;
 }
 
+export interface LocalProductBatch {
+  id: string;
+  store_id: string;
+  product_id: string;
+  batch_no: string;
+  expiry_date: string;
+  quantity: number;
+  created_at: string;
+}
+
+export interface LocalWarehouse {
+  id: string;
+  store_id: string;
+  name: string;
+  address?: string;
+  created_at: string;
+}
+
+export interface LocalWarehouseStock {
+  id: string;
+  store_id: string;
+  warehouse_id: string;
+  product_id: string;
+  stock: number;
+}
+
+export interface LocalUserPermission {
+  id: string;
+  store_id: string;
+  user_id: string;
+  permission_key: string;
+  enabled: boolean;
+}
+
 class PosDatabase extends Dexie {
   categories!: Table<LocalCategory, string>;
+  promotions!: Table<LocalPromotion, string>;
   products!: Table<LocalProduct, string>;
   shifts!: Table<LocalShift, string>;
   transactions!: Table<LocalTransaction, string>;
@@ -219,9 +300,16 @@ class PosDatabase extends Dexie {
   customerDebts!: Table<LocalCustomerDebt, string>;
   suppliers!: Table<LocalSupplier, string>;
   purchaseOrders!: Table<LocalPurchaseOrder, string>;
+  purchaseOrderItems!: Table<LocalPurchaseOrderItem, string>;
   kitchenOrders!: Table<LocalKitchenOrder, string>;
   memberships!: Table<LocalMembership, string>;
   pendingOps!: Table<LocalPendingOp, string>;
+  debtPayments!: Table<LocalDebtPayment, string>;
+  cashTransactions!: Table<LocalCashTransaction, string>;
+  productBatches!: Table<LocalProductBatch, string>;
+  warehouses!: Table<LocalWarehouse, string>;
+  warehouseStocks!: Table<LocalWarehouseStock, string>;
+  userPermissions!: Table<LocalUserPermission, string>;
 
   constructor() {
     super('PosDatabase');
@@ -287,6 +375,29 @@ class PosDatabase extends Dexie {
     // Version 12: Add pendingOps table for offline admin CRUD queue
     this.version(12).stores({
       pendingOps: 'id, store_id, table, sync_status, created_at',
+    });
+    // Version 13: Add debtPayments table for piutang payment tracking
+    this.version(13).stores({
+      debtPayments: 'id, store_id, debt_id, payment_method, paid_at, sync_status',
+    });
+    // Version 14: Add purchaseOrderItems table for PO line items
+    this.version(14).stores({
+      purchaseOrderItems: 'id, store_id, purchase_order_id, product_id',
+    });
+    // Version 15: Add cashTransactions table for cash in/out during shifts
+    this.version(15).stores({
+      cashTransactions: 'id, store_id, shift_id, type, created_at',
+    });
+    // Version 16: Add promotions table for scheduled promotions
+    this.version(16).stores({
+      promotions: 'id, store_id, enabled, start_date, end_date',
+    });
+    // Version 17: Add product batches, warehouses, warehouse stocks, and user permissions
+    this.version(17).stores({
+      productBatches: 'id, store_id, product_id, batch_no, expiry_date',
+      warehouses: 'id, store_id, name',
+      warehouseStocks: 'id, store_id, warehouse_id, product_id',
+      userPermissions: 'id, store_id, user_id, permission_key',
     });
   }
 }

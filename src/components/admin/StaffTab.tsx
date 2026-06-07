@@ -29,6 +29,8 @@ interface StaffTabProps {
   onInviteRoleChange: (r: 'ADMIN' | 'KASIR') => void;
   onInviteMaxUsesChange: (n: number) => void;
   onInviteExpiryChange: (d: string) => void;
+  permissions?: Record<string, Record<string, boolean>>;
+  onTogglePermission?: (userId: string, key: string, currentEnabled: boolean) => void;
 }
 
 const roleIcon: Record<string, React.ComponentType<{ className?: string }>> = { OWNER: Crown, ADMIN: Shield, KASIR: User };
@@ -39,6 +41,7 @@ export default function StaffTab({
   onGenerateInvite, onRevokeInvite, onRemoveMember, onChangeRole, onAddMember,
   inviteCode, inviteRole, inviteMaxUses, inviteExpiry, generatingInvite,
   onInviteRoleChange, onInviteMaxUsesChange, onInviteExpiryChange,
+  permissions, onTogglePermission,
 }: StaffTabProps) {
   const [showAddMember, setShowAddMember] = useState(false);
   const [addEmail, setAddEmail] = useState('');
@@ -189,34 +192,68 @@ export default function StaffTab({
               {filteredMembers.map((m) => {
                 const Icon = roleIcon[m.role] || User;
                 return (
-                  <div key={m.id} className="p-4 flex items-center justify-between hover:bg-surface-muted">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className="w-10 h-10 rounded-full bg-primary-soft flex items-center justify-center flex-shrink-0"><Icon className="w-5 h-5 text-primary" /></div>
-                      <div className="min-w-0">
-                        <p className="font-sans font-semibold text-sm text-ink truncate">{m.user_name || m.user_email}</p>
-                        <p className="font-sans text-xs text-slate truncate">{m.user_email}</p>
-                        {m.created_at && <p className="font-sans text-[11px] text-muted">Bergabung {formatDate(m.created_at)}</p>}
+                  <div key={m.id} className="p-4 flex flex-col gap-3 hover:bg-surface-muted/50 transition-colors">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-10 h-10 rounded-full bg-primary-soft flex items-center justify-center flex-shrink-0"><Icon className="w-5 h-5 text-primary" /></div>
+                        <div className="min-w-0">
+                          <p className="font-sans font-semibold text-sm text-ink truncate">{m.user_name || m.user_email}</p>
+                          <p className="font-sans text-xs text-slate truncate">{m.user_email}</p>
+                          {m.created_at && <p className="font-sans text-[11px] text-muted">Bergabung {formatDate(m.created_at)}</p>}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 ml-3 flex-shrink-0">
+                        {m.role !== 'OWNER' && isOwner && (
+                          <select value={m.role} onChange={(e) => onChangeRole(m.id, e.target.value)} className="bg-surface border border-hairline rounded-lg px-2 h-[40px] text-[12px] focus:outline-none focus:border-primary font-sans cursor-pointer">
+                            <option value="ADMIN">Admin</option>
+                            <option value="KASIR">Kasir</option>
+                          </select>
+                        )}
+                        {m.role === 'OWNER' && (
+                          <span className="font-sans text-xs font-semibold text-warning bg-warning-soft px-2.5 py-1 rounded-lg flex items-center gap-1"><Crown className="w-3 h-3" />Pemilik</span>
+                        )}
+                        {m.role !== 'OWNER' && !isOwner && (
+                          <span className="font-sans text-xs font-semibold text-slate bg-surface-muted px-2.5 py-1 rounded-lg">{roleLabel[m.role]}</span>
+                        )}
+                        {m.role !== 'OWNER' && (activeRole === 'OWNER' || activeRole === 'ADMIN') && (
+                          <button onClick={() => handleRemoveMember(m.id, m.role)} className="p-2 text-danger hover:bg-danger-soft rounded-lg transition-colors cursor-pointer" title="Hapus anggota">
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
                       </div>
                     </div>
-                    <div className="flex items-center gap-2 ml-3 flex-shrink-0">
-                      {m.role !== 'OWNER' && isOwner && (
-                        <select value={m.role} onChange={(e) => onChangeRole(m.id, e.target.value)} className="bg-surface border border-hairline rounded-lg px-2 h-[40px] text-[12px] focus:outline-none focus:border-primary font-sans cursor-pointer">
-                          <option value="ADMIN">Admin</option>
-                          <option value="KASIR">Kasir</option>
-                        </select>
-                      )}
-                      {m.role === 'OWNER' && (
-                        <span className="font-sans text-xs font-semibold text-warning bg-warning-soft px-2.5 py-1 rounded-lg flex items-center gap-1"><Crown className="w-3 h-3" />Pemilik</span>
-                      )}
-                      {m.role !== 'OWNER' && !isOwner && (
-                        <span className="font-sans text-xs font-semibold text-slate bg-surface-muted px-2.5 py-1 rounded-lg">{roleLabel[m.role]}</span>
-                      )}
-                      {m.role !== 'OWNER' && (activeRole === 'OWNER' || activeRole === 'ADMIN') && (
-                        <button onClick={() => handleRemoveMember(m.id, m.role)} className="p-2 text-danger hover:bg-danger-soft rounded-lg transition-colors cursor-pointer" title="Hapus anggota">
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      )}
-                    </div>
+
+                    {m.role !== 'OWNER' && (
+                      <div className="pt-2 border-t border-hairline/60">
+                        <p className="text-[11px] font-semibold text-slate mb-2 uppercase tracking-wider">Hak Akses Granular</p>
+                        <div className="grid grid-cols-2 gap-2">
+                          {[
+                            { key: 'void_cart', label: 'Void Keranjang' },
+                            { key: 'apply_discount', label: 'Terapkan Diskon' },
+                            { key: 'view_reports', label: 'Lihat Laporan' },
+                            { key: 'manage_stock', label: 'Kelola Stok & Gudang' },
+                          ].map((p) => {
+                            const isEnabled = permissions?.[m.user_id]?.[p.key] ?? false;
+                            return (
+                              <button
+                                key={p.key}
+                                type="button"
+                                disabled={!isOwner}
+                                onClick={() => onTogglePermission?.(m.user_id, p.key, isEnabled)}
+                                className={`flex items-center justify-between px-3 py-2 rounded-lg border text-xs font-sans transition-all ${
+                                  isEnabled
+                                    ? 'bg-primary-soft text-primary border-primary/30'
+                                    : 'bg-canvas text-slate border-hairline hover:bg-surface-muted'
+                                } ${isOwner ? 'cursor-pointer' : 'cursor-default opacity-80'}`}
+                              >
+                                <span>{p.label}</span>
+                                <span className={`w-2.5 h-2.5 rounded-full ml-2 ${isEnabled ? 'bg-primary shadow-[0_0_8px_rgba(var(--color-primary),0.5)]' : 'bg-slate/30'}`} />
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}

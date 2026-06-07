@@ -1,59 +1,75 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { type LocalProduct } from '@/lib/dexie';
 import { Printer, X, Barcode } from 'lucide-react';
+import JsBarcode from 'jsbarcode';
 
 interface BarcodePrinterProps {
   product: LocalProduct;
   onClose: () => void;
 }
 
-// Pure JS/TS Code128 Encoder Helper (Code 128 Auto/B subset)
-function getCode128Bars(value: string): string {
-  // Simple representation of Code 128 Start B, Stop, and character bar patterns
-  // Code 128 symbols are composed of 3 bars and 3 spaces (except stop)
-  // For simplicity and 100% self-containment, we map basic characters (A-Z, 0-9) to bar widths
-  // 1 = thin bar, 2 = medium bar, 3 = thick bar, 4 = very thick bar, etc.
-  const code128Patterns: Record<string, string> = {
-    ' ': '11011001100', '0': '10111100010', '1': '10001011110', '2': '10100011110',
-    '3': '10100111100', '4': '10100110000', '5': '10101100000', '6': '10101100000',
-    '7': '10100000110', '8': '10000010110', '9': '10000101100', 'A': '11010000100',
-    'B': '11010010000', 'C': '11010011100', 'D': '11000101000', 'E': '11000101110',
-    'F': '11000111010', 'G': '11000111010', 'H': '11011101000', 'I': '11011101100',
-    'J': '11011100010', 'K': '11011101011', 'L': '11011101101', 'M': '11011101101',
-    'N': '11000111011', 'O': '11001110110', 'P': '11001110110', 'Q': '11010111000',
-    'R': '11010111001', 'S': '11010111100', 'T': '11010111100', 'U': '11010111100',
-    'V': '11011101000', 'W': '11011101001', 'X': '11011101100', 'Y': '11011101100',
-    'Z': '11011101110', '-': '10001011000', '.': '10001011110',
-  };
-
-  // Fallback to start pattern (B), data bars, checksum character, and stop pattern
-  const startPattern = '11010010000'; // Start Code B
-  const stopPattern = '1100011101011'; // Stop pattern
-  
-  let dataBars = startPattern;
-  const uppercase = value.toUpperCase();
-  for (let i = 0; i < uppercase.length; i++) {
-    const char = uppercase[i];
-    dataBars += code128Patterns[char] || '10101111000'; // Space pattern fallback
-  }
-  
-  dataBars += stopPattern;
-  return dataBars;
-}
-
 export default function BarcodePrinter({ product, onClose }: BarcodePrinterProps) {
   const [printQty, setPrintQty] = useState(1);
-  const barPattern = getCode128Bars(product.sku);
+  const previewBarcodeRef = useRef<SVGSVGElement>(null);
+
+  // Render barcode preview using jsbarcode
+  useEffect(() => {
+    if (previewBarcodeRef.current) {
+      try {
+        JsBarcode(previewBarcodeRef.current, product.sku, {
+          format: 'CODE128',
+          width: 2,
+          height: 50,
+          displayValue: false,
+        });
+      } catch (err) {
+        console.warn('Failed to render barcode:', err);
+      }
+    }
+  }, [product.sku]);
 
   const handlePrint = () => {
     const printWindow = window.open('', '_blank');
     if (!printWindow) return;
 
-    const barsHtml = barPattern.split('').map(bit => 
-      `<div style="flex: 1; height: 50px; background-color: ${bit === '1' ? '#000' : 'transparent'};"></div>`
-    ).join('');
+    // Generate SVG barcode for each label
+    const labels = Array.from({ length: printQty })
+      .map(() => {
+        // Create a temporary SVG to convert to data URI
+        const svg = document.createElement('svg');
+        try {
+          JsBarcode(svg, product.sku, {
+            format: 'CODE128',
+            width: 2,
+            height: 50,
+            displayValue: false,
+          });
+          const svgString = svg.outerHTML;
+          const encodedSvg = encodeURIComponent(svgString);
+          const dataUri = `data:image/svg+xml,${encodedSvg}`;
+          return `
+            <div class="label-page">
+              <div class="title">${product.name}</div>
+              <img class="barcode-image" src="${dataUri}" alt="Barcode" />
+              <div class="sku">${product.sku}</div>
+              <div class="price">Rp ${product.price.toLocaleString('id-ID')}</div>
+            </div>
+          `;
+        } catch (err) {
+          console.warn('Failed to generate barcode:', err);
+          return `
+            <div class="label-page">
+              <div class="title">${product.name}</div>
+              <div class="barcode-error">Error generating barcode</div>
+              <div class="sku">${product.sku}</div>
+              <div class="price">Rp ${product.price.toLocaleString('id-ID')}</div>
+            </div>
+          `;
+        }
+      })
+      .join('');
 
     printWindow.document.write(`
       <html>
@@ -70,6 +86,7 @@ export default function BarcodePrinter({ product, onClose }: BarcodePrinterProps
               font-family: 'Inter', sans-serif;
               background: #fff;
               -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
             }
             .label-page {
               width: 50mm;
@@ -93,11 +110,20 @@ export default function BarcodePrinter({ product, onClose }: BarcodePrinterProps
               overflow: hidden;
               text-overflow: ellipsis;
             }
-            .barcode-container {
-              display: flex;
+            .barcode-image {
+              max-width: 44mm;
+              max-height: 12mm;
+              margin: 1mm 0;
+            }
+            .barcode-error {
+              font-size: 7px;
+              color: red;
+              margin: 1mm 0;
               width: 44mm;
               height: 12mm;
-              margin: 1mm 0;
+              display: flex;
+              align-items: center;
+              justify-content: center;
             }
             .sku {
               font-family: monospace;
@@ -113,14 +139,7 @@ export default function BarcodePrinter({ product, onClose }: BarcodePrinterProps
           </style>
         </head>
         <body>
-          ${Array.from({ length: printQty }).map(() => `
-            <div class="label-page">
-              <div class="title">${product.name}</div>
-              <div class="barcode-container">${barsHtml}</div>
-              <div class="sku">${product.sku}</div>
-              <div class="price">Rp ${product.price.toLocaleString('id-ID')}</div>
-            </div>
-          `).join('')}
+          ${labels}
           <script>
             window.onload = function() {
               window.print();
@@ -174,15 +193,11 @@ export default function BarcodePrinter({ product, onClose }: BarcodePrinterProps
           </div>
 
           {/* Render Preview */}
-          <div className="border border-dashed border-hairline rounded-xl p-4 flex flex-col items-center bg-white shadow-inner">
+          <div className="border border-dashed border-hairline rounded-xl p-4 flex flex-col items-center bg-surface shadow-inner">
             <span className="text-[10px] text-slate font-sans mb-3 uppercase tracking-wider font-semibold">Preview Label (50x30mm)</span>
             <div className="border border-ink/40 w-[180px] h-[108px] p-2 flex flex-col justify-between items-center text-ink select-none">
               <span className="text-[9px] font-sans font-bold text-center w-full truncate leading-tight">{product.name}</span>
-              <div className="flex w-[140px] h-[36px] items-stretch">
-                {barPattern.split('').map((bit, idx) => (
-                  <div key={idx} className={`flex-1 ${bit === '1' ? 'bg-ink' : 'bg-transparent'}`}></div>
-                ))}
-              </div>
+              <svg ref={previewBarcodeRef} className="max-w-[140px] max-h-[36px]"></svg>
               <span className="font-mono text-[8px] tracking-wider leading-none mt-0.5">{product.sku}</span>
               <span className="text-[10px] font-sans font-bold leading-none mt-0.5">Rp {product.price.toLocaleString('id-ID')}</span>
             </div>

@@ -64,6 +64,34 @@ create table public.categories (
     updated_at timestamptz default now()
 );
 
+-- 5.5. Promotions (scoped to store, scheduled)
+create table public.promotions (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    name text not null,
+    description text,
+    type text not null check (type in ('PERCENT', 'FIXED')) default 'PERCENT',
+    value numeric(12, 2) not null check (value >= 0),
+    start_date timestamptz not null,
+    end_date timestamptz not null,
+    enabled boolean not null default true,
+    created_at timestamptz default now() not null,
+    updated_at timestamptz default now()
+);
+alter table public.promotions enable row level security;
+create policy "Members can view promotions" on public.promotions
+    for select to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can manage promotions" on public.promotions
+    for insert to authenticated
+    with check (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can update promotions" on public.promotions
+    for update to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can delete promotions" on public.promotions
+    for delete to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+
 -- 6. Products (scoped to store)
 create table public.products (
     id uuid default gen_random_uuid() primary key,
@@ -86,6 +114,7 @@ create table public.shifts (
     user_id uuid references public.users(id) on delete cascade not null,
     start_time timestamptz default now() not null,
     end_time timestamptz,
+    beginning_cash numeric(12, 2) default 0 not null check (beginning_cash >= 0),
     status text not null check (status in ('OPEN', 'CLOSED')) default 'OPEN',
     created_at timestamptz default now() not null
 );
@@ -386,6 +415,7 @@ create table if not exists public.customers (
     name text not null,
     phone text not null default '',
     email text not null default '',
+    credit_limit numeric(12,2) not null default 0,
     created_at timestamptz default now() not null,
     updated_at timestamptz default now()
 );
@@ -500,7 +530,7 @@ create policy "Members can create payment splits" on public.payment_splits
 create table if not exists public.returns (
     id uuid default gen_random_uuid() primary key,
     store_id uuid references public.stores(id) on delete cascade not null,
-    transaction_id uuid references public.transactions(id) on delete cascade not null,
+    transaction_id uuid references public.transactions(id) on delete set null,
     user_id uuid references public.users(id) on delete cascade not null,
     items jsonb not null default '[]'::jsonb,
     reason text not null default '',
@@ -1198,6 +1228,71 @@ create trigger updated_at_customer_debts before update on public.customer_debts
 create index if not exists idx_customer_debts_store_customer on public.customer_debts(store_id, customer_id);
 create index if not exists idx_customer_debts_transaction on public.customer_debts(transaction_id);
 
+-- RPC: Apply a payment to a customer debt, updating remaining_amount and status
+create or replace function public.apply_debt_payment(
+    p_debt_id uuid,
+    p_amount numeric
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_remaining numeric;
+    v_new_status text;
+begin
+    update public.customer_debts
+    set remaining_amount = remaining_amount - p_amount,
+        status = case
+            when remaining_amount - p_amount <= 0 then 'PAID'
+            else 'PARTIALLY_PAID'
+        end,
+        updated_at = now()
+    where id = p_debt_id
+    returning remaining_amount, status into v_remaining, v_new_status;
+
+    if not found then
+        return jsonb_build_object('error', 'Debt not found');
+    end if;
+
+    return jsonb_build_object('success', true, 'remaining_amount', v_remaining, 'status', v_new_status);
+end;
+$$;
+
+-- ==========================================
+-- Debt Payments (Piutang Payments) Schema
+-- ==========================================
+
+create table if not exists public.debt_payments (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    debt_id uuid references public.customer_debts(id) on delete cascade not null,
+    amount numeric(12, 2) not null check (amount > 0),
+    payment_method text not null check (payment_method in ('CASH', 'TRANSFER', 'CARD', 'OTHER')) default 'CASH',
+    paid_at timestamptz default now() not null,
+    notes text default '',
+    created_at timestamptz default now() not null
+);
+
+alter table public.debt_payments enable row level security;
+
+create policy "Members can view store debt payments" on public.debt_payments
+    for select to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can create store debt payments" on public.debt_payments
+    for insert to authenticated
+    with check (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Admins can update store debt payments" on public.debt_payments
+    for update to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()) and public.get_user_role(store_id) in ('OWNER', 'ADMIN'))
+    with check (store_id in (select store_id from public.store_members where user_id = auth.uid()) and public.get_user_role(store_id) in ('OWNER', 'ADMIN'));
+create policy "Admins can delete store debt payments" on public.debt_payments
+    for delete to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()) and public.get_user_role(store_id) in ('OWNER', 'ADMIN'));
+
+create index if not exists idx_debt_payments_debt on public.debt_payments(debt_id);
+create index if not exists idx_debt_payments_store on public.debt_payments(store_id);
+
 -- ==========================================
 -- 13. Suppliers, POs, KDS, and Memberships
 -- ==========================================
@@ -1224,6 +1319,95 @@ create table if not exists public.purchase_orders (
     created_at timestamptz default now() not null,
     updated_at timestamptz default now()
 );
+
+-- Purchase Order Items
+create table if not exists public.purchase_order_items (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    purchase_order_id uuid references public.purchase_orders(id) on delete cascade not null,
+    product_id uuid references public.products(id) on delete cascade not null,
+    quantity integer not null check (quantity > 0),
+    unit_price numeric(12, 2) not null check (unit_price >= 0),
+    subtotal numeric(12, 2) not null check (subtotal >= 0),
+    created_at timestamptz default now() not null
+);
+
+alter table public.purchase_order_items enable row level security;
+
+create policy "Members can view store purchase order items" on public.purchase_order_items
+    for select to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can create store purchase order items" on public.purchase_order_items
+    for insert to authenticated
+    with check (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Admins can update store purchase order items" on public.purchase_order_items
+    for update to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()) and public.get_user_role(store_id) in ('OWNER', 'ADMIN'))
+    with check (store_id in (select store_id from public.store_members where user_id = auth.uid()) and public.get_user_role(store_id) in ('OWNER', 'ADMIN'));
+create policy "Admins can delete store purchase order items" on public.purchase_order_items
+    for delete to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()) and public.get_user_role(store_id) in ('OWNER', 'ADMIN'));
+
+create index if not exists idx_purchase_order_items_po on public.purchase_order_items(purchase_order_id);
+create index if not exists idx_purchase_order_items_store on public.purchase_order_items(store_id);
+
+-- RPC: Receive a purchase order — update status + insert items + increment stock atomically
+create or replace function public.receive_purchase_order(
+    p_po_id uuid,
+    p_store_id uuid,
+    p_items jsonb
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_item jsonb;
+    v_product_id uuid;
+    v_quantity integer;
+    v_unit_price numeric;
+    v_subtotal numeric;
+    v_total numeric := 0;
+    v_item_id uuid;
+begin
+    -- Verify PO exists and is PENDING
+    if not exists (select 1 from public.purchase_orders where id = p_po_id and store_id = p_store_id and status = 'PENDING') then
+        return jsonb_build_object('error', 'PO not found or not in PENDING status');
+    end if;
+
+    -- Process each item
+    for v_item in select * from jsonb_array_elements(p_items)
+    loop
+        v_product_id := (v_item->>'product_id')::uuid;
+        v_quantity := (v_item->>'quantity')::integer;
+        v_unit_price := (v_item->>'unit_price')::numeric;
+        v_subtotal := v_quantity * v_unit_price;
+        v_total := v_total + v_subtotal;
+        v_item_id := gen_random_uuid();
+
+        -- Insert purchase_order_item
+        insert into public.purchase_order_items (id, store_id, purchase_order_id, product_id, quantity, unit_price, subtotal)
+        values (v_item_id, p_store_id, p_po_id, v_product_id, v_quantity, v_unit_price, v_subtotal);
+
+        -- Increment product stock
+        update public.products
+        set stock = stock + v_quantity
+        where id = v_product_id and store_id = p_store_id;
+
+        -- Log stock history
+        insert into public.stock_history (store_id, product_id, user_id, old_stock, new_stock, reason)
+        select p_store_id, v_product_id, auth.uid(), stock - v_quantity, stock, 'PO Receive'
+        from public.products where id = v_product_id and store_id = p_store_id;
+    end loop;
+
+    -- Update PO status and total
+    update public.purchase_orders
+    set status = 'RECEIVED', total_amount = v_total, updated_at = now()
+    where id = p_po_id;
+
+    return jsonb_build_object('success', true, 'total_amount', v_total);
+end;
+$$;
 
 -- Kitchen Orders
 create table if not exists public.kitchen_orders (
@@ -1323,7 +1507,271 @@ create trigger updated_at_memberships before update on public.memberships
 -- Indexes
 create index if not exists idx_suppliers_store on public.suppliers(store_id);
 create index if not exists idx_purchase_orders_store_supplier on public.purchase_orders(store_id, supplier_id);
+create index if not exists idx_purchase_order_items_po on public.purchase_order_items(purchase_order_id);
+create index if not exists idx_purchase_order_items_store on public.purchase_order_items(store_id);
 create index if not exists idx_kitchen_orders_store_transaction on public.kitchen_orders(store_id, transaction_id);
 create index if not exists idx_memberships_store_customer on public.memberships(store_id, customer_id);
 
+-- ==========================================
+-- Cash Management (Cash In/Out)
+-- ==========================================
 
+create table if not exists public.cash_transactions (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    shift_id uuid references public.shifts(id) on delete cascade not null,
+    type text not null check (type in ('IN', 'OUT')),
+    amount numeric(12, 2) not null check (amount > 0),
+    reason text not null default '',
+    created_at timestamptz default now() not null
+);
+
+alter table public.cash_transactions enable row level security;
+
+create policy "Members can view store cash_transactions" on public.cash_transactions
+    for select to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can create store cash_transactions" on public.cash_transactions
+    for insert to authenticated
+    with check (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+
+create index if not exists idx_cash_transactions_shift on public.cash_transactions(shift_id);
+create index if not exists idx_cash_transactions_store on public.cash_transactions(store_id);
+
+-- ==========================================
+-- Loyalty Points RPCs
+-- ==========================================
+
+create or replace function public.award_points(
+    p_store_id uuid,
+    p_customer_id uuid,
+    p_points integer
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_membership_id uuid;
+    v_current_points integer;
+    v_current_tier text;
+    v_new_tier text;
+begin
+    -- Upsert membership
+    insert into public.memberships (id, store_id, customer_id, points, tier)
+    values (gen_random_uuid(), p_store_id, p_customer_id, p_points, 'BRONZE')
+    on conflict (customer_id) do update set
+        points = memberships.points + p_points,
+        updated_at = now()
+    returning id, points, tier into v_membership_id, v_current_points, v_current_tier;
+
+    -- Auto-upgrade tier
+    v_new_tier := v_current_tier;
+    if v_current_points >= 1000 then
+        v_new_tier := 'GOLD';
+    elsif v_current_points >= 500 then
+        v_new_tier := 'SILVER';
+    end if;
+
+    if v_new_tier != v_current_tier then
+        update public.memberships set tier = v_new_tier, updated_at = now()
+        where id = v_membership_id;
+    end if;
+
+    return jsonb_build_object('success', true, 'points', v_current_points, 'tier', v_new_tier);
+end;
+$$;
+
+create or replace function public.redeem_points(
+    p_store_id uuid,
+    p_customer_id uuid,
+    p_points integer
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_current_points integer;
+begin
+    select points into v_current_points
+    from public.memberships
+    where store_id = p_store_id and customer_id = p_customer_id;
+
+    if not found then
+        return jsonb_build_object('error', 'Membership tidak ditemukan');
+    end if;
+create index if not exists idx_memberships_store_customer on public.memberships(store_id, customer_id);
+
+-- ==========================================
+-- Cash Management (Cash In/Out)
+-- ==========================================
+
+create table if not exists public.cash_transactions (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    shift_id uuid references public.shifts(id) on delete cascade not null,
+    type text not null check (type in ('IN', 'OUT')),
+    amount numeric(12, 2) not null check (amount > 0),
+    reason text not null default '',
+    created_at timestamptz default now() not null
+);
+
+alter table public.cash_transactions enable row level security;
+
+create policy "Members can view store cash_transactions" on public.cash_transactions
+    for select to authenticated
+    using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can create store cash_transactions" on public.cash_transactions
+    for insert to authenticated
+    with check (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+
+create index if not exists idx_cash_transactions_shift on public.cash_transactions(shift_id);
+create index if not exists idx_cash_transactions_store on public.cash_transactions(store_id);
+
+-- ==========================================
+-- Loyalty Points RPCs
+-- ==========================================
+
+create or replace function public.award_points(
+    p_store_id uuid,
+    p_customer_id uuid,
+    p_points integer
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_membership_id uuid;
+    v_current_points integer;
+    v_current_tier text;
+    v_new_tier text;
+begin
+    -- Upsert membership
+    insert into public.memberships (id, store_id, customer_id, points, tier)
+    values (gen_random_uuid(), p_store_id, p_customer_id, p_points, 'BRONZE')
+    on conflict (customer_id) do update set
+        points = memberships.points + p_points,
+        updated_at = now()
+    returning id, points, tier into v_membership_id, v_current_points, v_current_tier;
+
+    -- Auto-upgrade tier
+    v_new_tier := v_current_tier;
+    if v_current_points >= 1000 then
+        v_new_tier := 'GOLD';
+    elsif v_current_points >= 500 then
+        v_new_tier := 'SILVER';
+    end if;
+
+    if v_new_tier != v_current_tier then
+        update public.memberships set tier = v_new_tier, updated_at = now()
+        where id = v_membership_id;
+    end if;
+
+    return jsonb_build_object('success', true, 'points', v_current_points, 'tier', v_new_tier);
+end;
+$$;
+
+create or replace function public.redeem_points(
+    p_store_id uuid,
+    p_customer_id uuid,
+    p_points integer
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_current_points integer;
+begin
+    select points into v_current_points
+    from public.memberships
+    where store_id = p_store_id and customer_id = p_customer_id;
+
+    if not found then
+        return jsonb_build_object('error', 'Membership tidak ditemukan');
+    end if;
+
+    if v_current_points < p_points then
+        return jsonb_build_object('error', 'Poin tidak mencukupi');
+    end if;
+
+    update public.memberships
+    set points = points - p_points, updated_at = now()
+    where store_id = p_store_id and customer_id = p_customer_id;
+
+    return jsonb_build_object('success', true, 'redeemed', p_points, 'remaining', v_current_points - p_points);
+end;
+$$;
+
+
+-- ==========================================
+-- Schema update v4: advanced POS tables
+-- ==========================================
+
+-- 1. Product Batches
+create table if not exists public.product_batches (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    product_id uuid references public.products(id) on delete cascade not null,
+    batch_no text not null,
+    expiry_date timestamptz not null,
+    quantity integer not null default 0 check (quantity >= 0),
+    created_at timestamptz default now() not null,
+    updated_at timestamptz default now()
+);
+alter table public.product_batches enable row level security;
+create policy "Members can view product_batches" on public.product_batches
+    for select to authenticated using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can manage product_batches" on public.product_batches
+    for all to authenticated using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+
+-- 2. Warehouses
+create table if not exists public.warehouses (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    name text not null,
+    address text,
+    created_at timestamptz default now() not null,
+    updated_at timestamptz default now()
+);
+alter table public.warehouses enable row level security;
+create policy "Members can view warehouses" on public.warehouses
+    for select to authenticated using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can manage warehouses" on public.warehouses
+    for all to authenticated using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+
+-- 3. Warehouse Stocks
+create table if not exists public.warehouse_stocks (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    warehouse_id uuid references public.warehouses(id) on delete cascade not null,
+    product_id uuid references public.products(id) on delete cascade not null,
+    stock integer not null default 0 check (stock >= 0),
+    created_at timestamptz default now() not null,
+    updated_at timestamptz default now(),
+    unique(warehouse_id, product_id)
+);
+alter table public.warehouse_stocks enable row level security;
+create policy "Members can view warehouse_stocks" on public.warehouse_stocks
+    for select to authenticated using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can manage warehouse_stocks" on public.warehouse_stocks
+    for all to authenticated using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+
+-- 4. User Permissions
+create table if not exists public.user_permissions (
+    id uuid default gen_random_uuid() primary key,
+    store_id uuid references public.stores(id) on delete cascade not null,
+    user_id uuid references public.users(id) on delete cascade not null,
+    permission_key text not null,
+    enabled boolean not null default true,
+    created_at timestamptz default now() not null,
+    updated_at timestamptz default now(),
+    unique(store_id, user_id, permission_key)
+);
+alter table public.user_permissions enable row level security;
+create policy "Members can view user_permissions" on public.user_permissions
+    for select to authenticated using (store_id in (select store_id from public.store_members where user_id = auth.uid()));
+create policy "Members can manage user_permissions" on public.user_permissions
+    for all to authenticated using (store_id in (select store_id from public.store_members where user_id = auth.uid()));

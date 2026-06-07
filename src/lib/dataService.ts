@@ -81,13 +81,14 @@ export const dataService = {
       return data;
     },
 
-    createShift: async (shiftId: string, storeId: string, userId: string, startTime: string) => {
+    createShift: async (shiftId: string, storeId: string, userId: string, startTime: string, beginningCash = 0) => {
       try {
         return await supabase.from('shifts').insert({
           id: shiftId,
           store_id: storeId,
           user_id: userId,
           start_time: startTime,
+          beginning_cash: beginningCash,
           status: 'OPEN',
         });
       } catch (err) {

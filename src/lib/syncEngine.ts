@@ -35,6 +35,7 @@ export async function syncShifts(storeId?: string) {
           user_id: shift.user_id,
           start_time: shift.start_time,
           end_time: shift.end_time || null,
+          beginning_cash: shift.beginning_cash || 0,
           status: shift.status
         }, { onConflict: 'id' });
 
@@ -74,6 +75,9 @@ export async function syncPendingTransactions(storeId?: string) {
     if (storeId) {
       allUnsynced = allUnsynced.filter(tx => tx.store_id === storeId);
     }
+
+    // Skip transactions abandoned after 5 failed sync attempts
+    allUnsynced = allUnsynced.filter(tx => (tx.sync_retries ?? 0) < 5);
 
     if (allUnsynced.length === 0) {
       return { success: true, syncedCount: 0 };
@@ -223,8 +227,8 @@ export async function syncPendingTransactions(storeId?: string) {
         const retries = (tx.sync_retries ?? 0) + 1;
         console.error(`Sync failed for transaction ${tx.id} (attempt ${retries}):`, err);
         if (retries >= 5) {
-          console.warn(`Giving up on transaction ${tx.id} after 5 failed sync attempts.`);
-          await db.transactions.update(tx.id, { sync_status: true, sync_retries: retries });
+          console.warn(`⚠️ Transaksi ${tx.id} gagal sync 5 kali. Data tetap disimpan lokal. Periksa koneksi atau hubungi admin.`);
+          await db.transactions.update(tx.id, { sync_retries: retries });
         } else {
           await db.transactions.update(tx.id, { sync_retries: retries });
         }
@@ -389,48 +393,53 @@ export async function syncPendingOps(storeId?: string) {
       }
 
       let opError: unknown = null;
-      switch (op.table) {
-        case 'categories': {
-          const p = op.payload as Record<string, unknown>;
-          if (op.operation === 'CREATE') {
-            const { error } = await supabase.from('categories').upsert({ id: op.record_id, store_id: op.store_id, ...p });
-            opError = error;
-          } else if (op.operation === 'UPDATE') {
-            const { error } = await supabase.from('categories').update(p).eq('id', op.record_id).eq('store_id', op.store_id);
-            opError = error;
-          } else if (op.operation === 'DELETE') {
-            const { error } = await supabase.from('categories').delete().eq('id', op.record_id).eq('store_id', op.store_id);
-            opError = error;
-          }
-          break;
+      const genericTables = [
+        'categories', 'products', 'customers', 'suppliers',
+        'product_batches', 'warehouses', 'warehouse_stocks', 'user_permissions'
+      ];
+
+      if (genericTables.includes(op.table)) {
+        const p = op.payload as Record<string, unknown>;
+        if (op.operation === 'CREATE' || op.operation === 'UPDATE') {
+          const { error } = await supabase.from(op.table).upsert({ id: op.record_id, store_id: op.store_id, ...p });
+          opError = error;
+        } else if (op.operation === 'DELETE') {
+          const { error } = await supabase.from(op.table).delete().eq('id', op.record_id).eq('store_id', op.store_id);
+          opError = error;
         }
-        case 'products': {
-          const p = op.payload as Record<string, unknown>;
-          if (op.operation === 'CREATE') {
-            const { error } = await supabase.from('products').upsert({ id: op.record_id, store_id: op.store_id, ...p });
-            opError = error;
-          } else if (op.operation === 'UPDATE') {
-            const { error } = await supabase.from('products').update(p).eq('id', op.record_id).eq('store_id', op.store_id);
-            opError = error;
-          } else if (op.operation === 'DELETE') {
-            const { error } = await supabase.from('products').delete().eq('id', op.record_id).eq('store_id', op.store_id);
-            opError = error;
+      } else {
+        switch (op.table) {
+          case 'debt_payments': {
+            const p = op.payload as { debt_id: string; amount: number; payment_method: string; notes?: string };
+            if (op.operation === 'CREATE') {
+              const { error: payError } = await supabase.from('debt_payments').insert({
+                id: op.record_id,
+                store_id: op.store_id,
+                debt_id: p.debt_id,
+                amount: p.amount,
+                payment_method: p.payment_method,
+                notes: p.notes || null,
+              });
+              if (!payError) {
+                await supabase.rpc('apply_debt_payment', { p_debt_id: p.debt_id, p_amount: p.amount });
+              }
+              opError = payError;
+            }
+            break;
           }
-          break;
-        }
-        case 'customers': {
-          const p = op.payload as Record<string, unknown>;
-          if (op.operation === 'CREATE') {
-            const { error } = await supabase.from('members').upsert({ id: op.record_id, store_id: op.store_id, ...p });
-            opError = error;
-          } else if (op.operation === 'UPDATE') {
-            const { error } = await supabase.from('members').update(p).eq('id', op.record_id).eq('store_id', op.store_id);
-            opError = error;
-          } else if (op.operation === 'DELETE') {
-            const { error } = await supabase.from('members').delete().eq('id', op.record_id).eq('store_id', op.store_id);
-            opError = error;
+          case 'purchase_orders': {
+            const p = op.payload as { supplier_id: string; items?: { product_id: string; quantity: number; unit_price: number }[]; status?: string };
+            if (op.operation === 'CREATE') {
+              const { error } = await supabase.from('purchase_orders').insert({
+                id: op.record_id, store_id: op.store_id, supplier_id: p.supplier_id, total_amount: 0, status: 'PENDING',
+              });
+              opError = error;
+            } else if (op.operation === 'UPDATE') {
+              const { error } = await supabase.from('purchase_orders').update({ status: p.status }).eq('id', op.record_id).eq('store_id', op.store_id);
+              opError = error;
+            }
+            break;
           }
-          break;
         }
       }
 
@@ -500,7 +509,7 @@ export async function cleanupSyncedData() {
     const dateLimit = thirtyDaysAgo.toISOString();
 
     const allTxs = await db.transactions.toArray();
-    const toDelete = allTxs.filter(tx => tx.sync_status === true && tx.created_at < dateLimit);
+    const toDelete = allTxs.filter(tx => (tx.sync_status === true || (tx.sync_retries ?? 0) >= 5) && tx.created_at < dateLimit);
     
     if (toDelete.length > 0) {
       const txIds = toDelete.map(tx => tx.id);

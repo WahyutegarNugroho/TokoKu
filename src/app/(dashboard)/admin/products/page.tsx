@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useCallback, startTransition } from 'react';
 import Image from 'next/image';
 import { supabase } from '@/lib/supabase';
+import { db } from '@/lib/dexie';
 import { useAuthStore } from '@/store/authStore';
 import { useToastStore } from '@/store/toastStore';
 import { categoriesApi, productsApi, activityApi, stockHistoryApi } from '@/lib/api';
@@ -53,11 +54,38 @@ export default function ProductsPage() {
     if (!activeStore) return;
     setDataLoading(true);
     try {
-      const { data: catData } = await categoriesApi.list(activeStore.id);
-      setCategories(catData || []);
+      // Read from Dexie first (offline-first)
+      const localCats = await db.categories.where('store_id').equals(activeStore.id).toArray();
+      if (localCats.length > 0) {
+        setCategories(localCats.map(c => ({ id: c.id, store_id: activeStore.id, name: c.name, description: c.description })));
+      }
+      const localProds = await db.products.where('store_id').equals(activeStore.id).toArray();
+      if (localProds.length > 0) {
+        setProducts(localProds.map(p => ({ id: p.id, store_id: p.store_id, name: p.name, sku: p.sku, price: p.price, category_id: p.category_id, stock: p.stock, image_url: p.image_url })));
+      }
       setProdPage(0);
-      const { data: prodData } = await productsApi.list(activeStore.id);
-      setProducts(prodData || []);
+
+      // Refresh from Supabase if online
+      if (navigator.onLine) {
+        const { data: catData } = await categoriesApi.list(activeStore.id);
+        if (catData) {
+          setCategories(catData);
+          await db.transaction('rw', db.categories, async () => {
+            for (const cat of catData) {
+              await db.categories.put({ id: cat.id, store_id: cat.store_id, name: cat.name, description: cat.description || undefined });
+            }
+          });
+        }
+        const { data: prodData } = await productsApi.list(activeStore.id);
+        if (prodData) {
+          setProducts(prodData);
+          await db.transaction('rw', db.products, async () => {
+            for (const prod of prodData) {
+              await db.products.put({ id: prod.id, store_id: prod.store_id, name: prod.name, sku: prod.sku, price: Number(prod.price), category_id: prod.category_id, stock: Number(prod.stock), image_url: prod.image_url });
+            }
+          });
+        }
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Gagal memuat data.';
       useToastStore.getState().addToast(message, 'error');
@@ -99,6 +127,17 @@ export default function ProductsPage() {
     } finally {
       setImageUploading(false);
     }
+  };
+
+  const generateSku = () => {
+    let newSku = '';
+    let exists = true;
+    while (exists) {
+      const randomDigits = Math.floor(1000000000 + Math.random() * 9000000000).toString();
+      newSku = 'TKP' + randomDigits;
+      exists = products.some((p) => p.sku === newSku);
+    }
+    setProdSku(newSku);
   };
 
   const saveProduct = async (e: React.FormEvent) => {
@@ -156,11 +195,11 @@ export default function ProductsPage() {
         }
         useToastStore.getState().addToast('Produk diperbarui.', 'success');
       } else {
-        const { error } = await productsApi.create(activeStore.id, basePayload);
+        const { data: newProd, error } = await productsApi.create(activeStore.id, basePayload);
         if (error) throw error;
         logActivity('CREATE_PRODUCT', 'Produk ' + basePayload.name + ' ditambahkan');
         if (basePayload.stock > 0) {
-          logStockHistory('temp', 0, basePayload.stock, 'Stok awal');
+          logStockHistory(newProd!.id, 0, basePayload.stock, 'Stok awal');
         }
         useToastStore.getState().addToast('Produk ditambahkan.', 'success');
       }
@@ -223,7 +262,16 @@ export default function ProductsPage() {
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-sm font-semibold text-charcoal mb-1">SKU</label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-sm font-semibold text-charcoal">SKU</label>
+                  <button
+                    type="button"
+                    onClick={generateSku}
+                    className="text-xs text-primary font-bold hover:underline cursor-pointer"
+                  >
+                    Gen
+                  </button>
+                </div>
                 <input
                   type="text"
                   required

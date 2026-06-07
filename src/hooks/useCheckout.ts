@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { useCartStore } from '@/store/cartStore';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useCartStore, validatePaymentSplits } from '@/store/cartStore';
 import { printReceipt } from '@/lib/printReceipt';
 import { formatShortId } from '@/lib/utils';
 import type { LocalProduct } from '@/lib/dexie';
@@ -26,7 +26,6 @@ export function useCheckout(activeStoreId: string | undefined, activeShiftId: st
   const { cart, subtotal, tax, discount, discountAmount, discountType, total, paymentSplits, taxEnabled, taxRate, checkout, setDiscount, setDiscountType, setPaymentSplits, setTaxConfig } = useCartStore();
 
   const [showPaymentModal, setShowPaymentModal] = useState(false);
-  const [changeAmount, setChangeAmount] = useState<number | null>(null);
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [lastTransaction, setLastTransaction] = useState<LastTransaction | null>(null);
@@ -38,12 +37,11 @@ export function useCheckout(activeStoreId: string | undefined, activeShiftId: st
     }
   }, [activeStore, setTaxConfig]);
 
-  useEffect(() => {
+  const changeAmount = useMemo(() => {
     const cashSplit = paymentSplits.find(s => s.method === 'CASH');
     const cash = cashSplit?.amount || 0;
     const nonCashTotal = paymentSplits.filter(s => s.method !== 'CASH').reduce((a, b) => a + (b.amount || 0), 0);
-    const amount = cash > total - nonCashTotal ? cash - (total - nonCashTotal) : null;
-    setTimeout(() => setChangeAmount(amount), 0);
+    return cash > total - nonCashTotal ? cash - (total - nonCashTotal) : null;
   }, [paymentSplits, total]);
 
   const handlePaymentSplitChange = useCallback((method: 'CASH' | 'DEBIT' | 'QRIS' | 'EWALLET' | 'TRANSFER' | 'CREDIT' | 'DEBT', value: number) => {
@@ -61,12 +59,13 @@ export function useCheckout(activeStoreId: string | undefined, activeShiftId: st
     if (submittingRef.current) return;
     submittingRef.current = true;
 
-    const nonCashTotal = paymentSplits.filter(s => s.method !== 'CASH').reduce((a, b) => a + (b.amount || 0), 0);
-    if (nonCashTotal > total) { setCheckoutError('Jumlah pembayaran non-tunai melebihi total tagihan.'); return; }
-    const splitTotal = paymentSplits.reduce((sum, s) => sum + (s.amount || 0), 0);
-    if (splitTotal < total) { setCheckoutError('Jumlah pembayaran kurang dari total tagihan.'); return; }
+    const valErr = validatePaymentSplits(paymentSplits, total);
+    if (valErr) {
+      setCheckoutError(valErr);
+      submittingRef.current = false;
+      return;
+    }
     const nonZero = paymentSplits.filter(s => s.amount > 0);
-    if (nonZero.length === 0) { setCheckoutError('Pilih minimal satu metode pembayaran.'); return; }
 
     setIsSubmitting(true);
     setCheckoutError(null);
@@ -98,7 +97,6 @@ export function useCheckout(activeStoreId: string | undefined, activeShiftId: st
       });
 
       setShowPaymentModal(false);
-      setChangeAmount(null);
       setDiscountInput('');
     } catch (err) {
       setCheckoutError(err instanceof Error ? err.message : 'Gagal memproses pembayaran.');
